@@ -1,0 +1,806 @@
+---
+title: "Gabes Customer Profile & Shopping Behavior Analysis"
+author: "Lisa Li"
+date: "9/18/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Clear all the variables
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r connection to Redshift, checking the data}
+
+library(RPostgreSQL)
+library(dplyr)
+library(dbplyr)
+library(data.table)
+library(lubridate)
+library(reshape2)
+
+# Create a connection to Redshift database from the dplyr package
+myRedshift <- src_postgres('dcmlogdata',
+                           host = "##",
+                           port = 5439,
+                           user = "##", 
+                           password = "##")
+
+# Create a table reference using the function tbl() (remote source in redshift database)
+src_tbls(myRedshift)
+
+# rename gabes tables
+accountDetails    <- tbl(myRedshift, "gabesaccountdetails") 
+itemsMaster       <- tbl(myRedshift, "gabesitemmastlist")
+tranitemSummary   <- tbl(myRedshift, "gabestrans")
+fiscalCalendar    <- tbl(myRedshift, "gabefiscalcalendar")
+merchHierarchy    <- tbl(myRedshift, "gabemerchhierarchy")
+dailyPerformance  <- tbl(myRedshift, "gabesdailystoreperformancelist")
+storeComp         <- tbl(myRedshift, "gabesstorecompdatetable")
+acxiom            <- tbl(myRedshift, "gabesaxciom")
+storemaster       <- tbl(myRedshift, "gabestoremasterlist")
+
+```
+
+
+```{r gabe's stores}
+
+# date range for 2017
+start.date <- '2016-01-01'
+end.date   <- '2017-12-30'
+
+# Filter stores that are open during the whole period (2016/2017)
+open_store_query <- tranitemSummary %>%
+  filter(trandate >= start.date,trandate < end.date) %>% 
+  select(trandate,storeid) %>%
+  left_join(fiscalCalendar, by = c("trandate" = "fiscalday")) %>% # Filter out the stores based on fiscalday
+  select(weekstart,storeid) %>% 
+  distinct() %>% 
+  group_by(storeid) %>% 
+  summarise(nb_weeks=n()) %>% 
+  ungroup() %>% 
+  filter(nb_weeks==105) %>% 
+  select(storeid)
+  
+open_store <- open_store_query %>%
+   collect() #94 stores
+
+open_store_num <- as.numeric(unlist(open_store))
+ 
+rugged_store  <- storemaster %>% 
+  filter(sid %in% open_store_num) %>% 
+  group_by(company) %>% 
+  summarise(nstore = n_distinct(sid)) %>% 
+  ungroup() %>% 
+  collect()
+
+gabe_store_list  <- storemaster %>% 
+  select(sid, company) %>% 
+  filter(sid %in% open_store_num,
+         company %in% 1) %>% 
+  group_by(sid) %>% 
+  ungroup() %>% 
+  collect()
+
+gabe_list <- as.numeric(unlist(gabe_store_list[,1]))
+
+```
+
+```{r gabe's segments}
+# 2017 buckets
+start.date <- '2017-01-01'
+end.date   <- '2017-12-30'
+
+# 2017 Active customers
+active_customers_query <- tranitemSummary %>%
+  filter(trandate >= start.date,
+         trandate < end.date,
+         storeid %in% gabe_list) %>% 
+  select(tranid, 
+         gtin,
+         trandate, 
+         storeid, 
+         customerid, 
+         totdiscountamount, 
+         totitemsaleprice) %>% 
+  distinct() %>% 
+  group_by(customerid) %>% 
+  summarise(ntran = n_distinct(tranid), 
+            nunit = n_distinct(gtin), 
+            nstore = n_distinct(storeid),
+            spend = sum(totitemsaleprice), 
+            discount = sum(totdiscountamount)) %>%  
+  filter(customerid != "" & spend > 0) %>% 
+  mutate(sp_tran_avg = spend/ntran,
+         sp_unit_avg = spend/nunit,
+         unit_avg = nunit/ntran) %>% 
+  ungroup() 
+
+active_customers <- active_customers_query %>%
+  collect()
+
+# filter the invaild customer ids 
+active_customers_f17 <- active_customers %>%
+  mutate(str_count = nchar(trimws(active_customers$customerid))) %>%
+  filter(str_count >= 8 )
+
+active_customers_f17 <- active_customers_f17 %>%
+  mutate(buckets = ifelse(ntran == 1, "one_and_done", 
+         ifelse(ntran > 1 & ntran < 4 & sp_tran_avg < 44, "repeat_customers", 
+                ifelse(ntran > 1 & ntran < 4 & sp_tran_avg > 44, "repeat_highvalue_customers",
+                       ifelse(ntran >= 4 & sp_tran_avg < 44, "loyal_customers", 
+                              "loyal_highvalue_customers")))))
+
+
+# pre- bucket analysis data
+active_customers_fre_gp <- active_customers_f17 %>%
+  select(customerid, ntran, spend) %>%
+  distinct() %>%
+  mutate(fre_gp = as.character(ifelse(ntran <=1,"1", 
+                         ifelse(ntran >1 & ntran <=3, "2 -- 3", 
+                                ifelse(ntran >3 & ntran <=5, "4 -- 5", 
+                                       ifelse(ntran >5 & ntran <=7, "6 -- 7", 
+                                              ifelse(ntran >7 & ntran <=9, "8 -- 9", 
+                                                     "10+" )))))),
+         count_cusid = rep(1,nrow(active_customers_f17))
+         ) %>%
+  group_by(fre_gp)  %>%
+  summarise(ccusid = sum(count_cusid),
+            ntran = sum(ntran))
+# active_customers_fre_gp data export 
+write.csv(active_customers_fre_gp,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/active_customers_fre_gp_gabe.csv")
+
+# total frequency median
+active_customers_mm_total17 <- active_customers_f17 %>%
+  select(customerid, 
+         ntran,
+         nunit, 
+         nstore,  
+         spend,
+         sp_tran_avg) %>% 
+  summarise(cusid17 = n_distinct(customerid),
+            ntran17 = sum(ntran), 
+            nunit17 = sum(nunit),
+            nstore17 = mean(nstore),
+            sp17 = sum(spend),
+            tran_mean = mean(ntran),
+            cus_sp_mean = mean(spend),
+            cus_sp_median = median(spend))
+write.csv(active_customers_mm_total17,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/active_customers_mm_total17_gabe.csv")
+
+# count the buckets
+active_customers_count17 <- active_customers_f17 %>%
+  select(buckets)%>%
+  count(buckets)
+write.csv(active_customers_count17 ,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/active_customers_count17_gabe.csv")
+
+# Average Numbers Anlysis -Traansaction
+average_numbers <- active_customers_f17 %>%
+  select(buckets, 
+         nunit,
+         ntran,
+         unit_avg,
+         customerid,
+         spend,
+         sp_unit_avg) %>%
+  group_by(buckets) %>%
+  summarise(tt_cus = n_distinct(customerid),
+            tt_sp = sum(spend),
+            tt_tran = sum(ntran),
+            tt_unit = sum(nunit),
+            avg_cus_sp = sum(spend)/n_distinct(customerid),
+            avg_cus_unit = mean(nunit), 
+            avg_sp_cus_unit = mean(sp_unit_avg),
+            avg_cus_tran = mean(ntran),
+            avg_cus_sp = mean(spend))
+write.csv(average_numbers,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/average_numbers_gabe.csv")
+
+```
+
+
+```{r seasonality analysis gabe's}
+# 2017 Transaction Total - Select all the needed data
+total_tran_unit17 <- tranitemSummary %>%
+  select(tranid, 
+         gtin,
+         trandate, 
+         storeid, 
+         customerid, 
+         totdiscountamount, 
+         totitemsaleprice) %>%
+  filter(trandate >= start.date,
+         trandate <= end.date,
+         customerid != "",
+         totitemsaleprice > 0,
+         storeid %in% gabe_list) %>%
+  collect()
+
+# Weekly trend by customers
+tran_unit_week <- total_tran_unit17 %>%
+  mutate(tran_week = week(trandate)) %>%
+  group_by(tran_week, customerid) %>% 
+  summarise(ntran = n_distinct(tranid),
+            nunit = n_distinct(gtin), 
+            spend = sum(totitemsaleprice), 
+            discount = sum(totdiscountamount)) 
+
+# Add buckets - data for seasonality analysis
+bucket_customers_week <- tran_unit_week %>%
+  mutate(str_count = nchar(trimws(customerid))) %>%
+  filter(str_count >= 8 ) %>%
+  left_join(active_customers_f17[,c(1,11)], by = "customerid")
+
+# Spend trend by buckets
+sp_trend_bucket <- bucket_customers_week %>%
+  select(tran_week, 
+         spend,
+         buckets) %>%
+  group_by(tran_week, 
+           buckets) %>%
+  summarise(sp_total = sum(spend)) %>%
+  dcast(tran_week ~ buckets)
+write.csv(sp_trend_bucket ,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/sp_trend_bucket_gabe.csv")
+```
+
+```{r  departments analysis gabe's }
+
+# Get all the item/ department data
+item_summary <- itemsMaster %>%
+  collect()
+merchhierarchy_summary <- merchHierarchy %>%
+  collect()
+
+# change the keys type for merging
+item_summary$icls <- as.character(item_summary$icls)
+item_summary$ugtin <- as.character(item_summary$ugtin)
+merchhierarchy_summary$ccls <- as.character(merchhierarchy_summary$ccls)
+merchhierarchy_summary$divnam <- as.character(merchhierarchy_summary$divnam)
+total_tran_unit17$gtin <- as.character(total_tran_unit17$gtin)
+
+# Add merchierarchy information
+dep_summary <- item_summary %>%
+  full_join(merchhierarchy_summary, by = c("icls" = "ccls"))
+
+# Filter columns
+dep_summary_filter <- dep_summary[,c(1,5,8,9,10,11,13,15,17,18)]
+tbl_vars(dep_summary_filter)
+
+# Read the groups fpr department data
+category <- read.csv("~/R/Projects/R-DCM/Gabes/Inputs/category.csv")
+category$rawcategory <- as.character(category$rawcategory)
+
+# Departments merge the buckets data
+dep_cus_bucket_ctg <- total_tran_unit17  %>%
+  mutate(str_count = nchar(trimws(customerid))) %>%
+  left_join(dep_summary_filter, by = c("gtin" = "ugtin")) %>%
+  left_join(category, by = c("divnam" = "rawcategory")) %>%
+  left_join(active_customers_f17[,c(1,11)], by = "customerid") %>%
+  filter(str_count >= 8)
+
+tbl_vars(total_tran_unit17)
+
+# Get the table of Category breaking down buckets
+ctg_sp_bucket_tbl <- dep_cus_bucket_ctg %>%
+  select(totitemsaleprice, category, buckets) %>%
+  group_by(category, buckets) %>% 
+  summarise(dep_sp = sum(totitemsaleprice)) %>%
+  dcast(category ~ buckets) 
+write.csv(ctg_sp_bucket_tbl ,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/ctg_sp_bucket_tbl_gabe.csv")
+
+# Buckets breaking down by departments
+dep_tran_bucket_tbl <- dep_cus_bucket_ctg %>%
+  select(tranno, divnam, buckets) %>%
+  group_by(divnam, buckets) %>% 
+  summarise(ntran = n_distinct(tranno)) %>%
+  dcast(divnam ~ buckets)
+write.csv(dep_traan_bucket_tbl ,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/dep_traan_bucket_tbl .csv")
+
+# Select data from acxiom
+acxiom_filter <- acxiom %>%
+  select(accountid,
+         dog_owner, cat_owner, online_purchaser,
+         int_sports, int_homeimprove, int_beauty, int_fashion, int_hunting, int_exercise_health, int_camp_hike, int_travel, 
+         home_type, net_worth, owner_renter, hh_income, cc_user, under_banked,
+         age2, age1, gender_email, ethnicity, marital_status, hh_total_children, adults_in_hh, 
+         occupation_email, education_email) %>%
+  collect()
+
+# Fix the customerid string problem
+active_customers_f17$customerid_fix <- trimws(active_customers_f17$customerid)
+
+# Merge all the data with buckets info
+acxiom_filter_V2 <- acxiom_filter %>% 
+  inner_join(active_customers_f17[,c(2,5,11,12)], by = c("accountid" = "customerid_fix")) 
+
+# Get the child numbers before fill the na with 0
+cus_demo_hh_child <- acxiom_filter_V2 %>% 
+  select(buckets, hh_total_children) %>%
+  group_by(buckets) %>%
+  count(hh_total_children) 
+
+cus_demo_hh_child  <- cus_demo_hh_child %>%
+  group_by(hh_total_children, buckets) %>%
+  summarise(cus_id = sum(n)) %>%
+  dcast( buckets ~ hh_total_children)
+write.csv(cus_demo_hh_child,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/cus_demo_hh_child_gabe.csv")
+
+# Fill NAs with 0
+acxiom_filter_V2[is.na(acxiom_filter_V2)] <- 0
+  
+# Get interest table
+cus_interest_total <- acxiom_filter_V2 %>% 
+  group_by(buckets) %>%
+  summarise(dog_owner = sum(dog_owner == "1"),
+           cat_owner = sum(cat_owner == "1"),
+           int_sports = sum(int_sports == "1"), 
+           int_homeimprove = sum(int_homeimprove == "1"), 
+           int_beauty = sum(int_beauty == "1"), 
+           int_fashion = sum(int_fashion == "1"), 
+           int_hunting = sum(int_hunting == "1"), 
+           int_exercise_health = sum(int_exercise_health == "1"), 
+           int_camp_hike  = sum(int_camp_hike == "1"),
+           int_travel = sum(int_travel == "1"),
+           online_purchaser = length(grep("Y", online_purchaser)))
+write.csv(cus_interest_total,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/cus_interest_total_gabe.csv")
+
+# Group age based on the clients PPT groups
+acxiom_filter_V3 <- acxiom_filter_V2 %>%
+  mutate(age_grp =  ifelse(age1 == 0, "No info", 
+                           ifelse(age1 < 18, "18-", 
+                                  ifelse(age1 >= 18 & age1 < 26, "18 to 25", 
+                                         ifelse(age1 >= 26 & age1 < 36, "26 to 35", 
+                                                ifelse(age1 >= 36 & age1 < 46, "36 to 45", 
+                                                       ifelse(age1 >= 46 & age1 < 56, "46 to 55", 
+                                                              ifelse(age1 >= 56 & age1 < 66, "56 to 65","65+"))))))))
+
+cus_demo_age <- acxiom_filter_V3 %>% 
+  select(buckets, age_grp) %>%
+  group_by(buckets) %>%
+  count(age_grp) 
+
+cus_demo_age  <- cus_demo_age %>%
+  group_by(age_grp, buckets) %>%
+  summarise(cus_id = sum(n)) %>%
+  dcast( buckets ~ age_grp)
+write.csv(cus_demo_age,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/cus_demo_age_gabe.csv")
+
+# total children for each bucket
+cus_demo_hh_child <- axciom_filter_V2 %>% 
+  select(buckets, hh_total_children) %>%
+  group_by(buckets) %>%
+  count(hh_total_children) 
+
+cus_demo_hh_child  <- cus_demo_hh_child %>%
+  group_by(hh_total_children, buckets) %>%
+  summarise(cus_id = sum(n)) %>%
+  dcast( buckets ~ hh_total_children)
+write.csv(cus_demo_hh_child,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/cus_demo_hh_child_gabe.csv")
+# gender table
+cus_demo_gender  <- acxiom_filter_V2 %>% 
+  select(buckets, gender_email) %>% 
+  group_by(buckets) %>%
+  count(gender_email) 
+
+cus_demo_gender  <- cus_demo_gender %>%
+  group_by(gender_email, buckets) %>%
+  summarise(cus_id = sum(n)) %>%
+  dcast( buckets ~ gender_email)
+write.csv(cus_demo_gender,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/cus_demo_gender_gabe.csv")
+# ethnicity table
+cus_demo_ethnicity  <- acxiom_filter_V2 %>% 
+  select(buckets, ethnicity) %>% 
+  group_by(buckets) %>%
+  count(ethnicity) 
+
+cus_demo_ethnicity  <- cus_demo_ethnicity %>%
+  group_by(ethnicity, buckets) %>%
+  summarise(cus_id = sum(n)) %>%
+  dcast( buckets ~ ethnicity)
+write.csv(cus_demo_ethnicity,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/cus_demo_ethnicity_gabe.csv")
+# marital_status table
+cus_demo_marital_status  <- acxiom_filter_V3 %>% 
+  select(buckets, marital_status) %>% 
+  group_by(buckets) %>%
+  count(marital_status) 
+
+cus_demo_marital_status  <- cus_demo_marital_status %>%
+  group_by(marital_status, buckets) %>%
+  summarise(cus_id = sum(n)) %>%
+  dcast( buckets ~ marital_status)
+write.csv(cus_demo_marital_status,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/cus_demo_marital_status_gabe.csv")
+
+# Economic tables
+cus_demo_hh_income  <- acxiom_filter_V2 %>% 
+  select(buckets, hh_income) %>% 
+  group_by(buckets) %>%
+  count(hh_income) 
+
+cus_demo_hh_income  <- cus_demo_hh_income %>%
+  group_by(hh_income, buckets) %>%
+  summarise(cus_id = sum(n)) %>%
+  dcast( buckets ~ hh_income)
+write.csv(cus_demo_hh_income,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/cus_demo_hh_income_gabe.csv")
+```
+
+```{r department vs interest analysis}
+# Fix the customerid string problem
+dep_cus_bucket_ctg$customerid_fix <- trimws(dep_cus_bucket_ctg$customerid)
+
+# Merge department & interest data
+interest_filter <- acxiom_filter_V2[,c(1,2,3,5,6,7,8,10,24)]
+
+dep_cus_bucket_ctg_V2 <- dep_cus_bucket_ctg %>%
+  inner_join(interest_filter, by = c("customerid_fix" = "accountid" ) ) 
+
+# Children table    
+child_dep <- dep_cus_bucket_ctg_V2 %>%
+  select(customerid, totitemsaleprice, buckets, divnam, category, hh_total_children) %>%
+  filter(grepl('^Children|Footwear|Kids accessories', category)) %>% 
+  filter(!grepl('FOOTWEAR WOMENS|FOOTWEAR MENS', divnam)) %>% 
+  mutate(children_index = ifelse(hh_total_children == 0, 0, 1)) %>%
+  group_by(buckets, children_index) %>%
+  summarise(ncus = n_distinct(customerid),
+            tsp = sum(totitemsaleprice))
+
+child_dep_table_cus <- child_dep %>%
+  select(buckets, children_index, ncus) %>%
+  group_by(children_index, buckets) %>% 
+  summarise(ntran = sum(ncus)) %>%
+  dcast(buckets ~ children_index)
+write.csv(child_dep_table_cus,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/child_dep_table_cus_gabe.csv")   
+
+# Home improvement
+homeimprovement_dep_cus <- dep_cus_bucket_ctg_V2 %>%
+  select(customerid, totitemsaleprice, buckets, divnam, category, int_homeimprove) %>%
+  filter(grepl('BLANKETS THROWS|FURNITURE|HOME DECOR|RUGS|SOFT HOME DECOR|STORAGE|WALL DECOR', divnam)) %>%
+  group_by(buckets,  int_homeimprove) %>%
+  summarise(ncus = n_distinct(customerid),
+            tsp = sum(totitemsaleprice))
+
+homeimprovement_dep_cus_table <- homeimprovement_dep_cus %>%
+  select(buckets, int_homeimprove, ncus) %>%
+  group_by(int_homeimprove, buckets) %>% 
+  summarise(ntran = sum(ncus)) %>%
+  dcast(buckets ~ int_homeimprove)
+write.csv(homeimprovement_dep_cus_table,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/homeimprovement_dep_cus_table_gabe.csv")   
+
+# Beauty and Cosmetics 
+beacos_dep_cus <- dep_cus_bucket_ctg_V2 %>%
+  select(customerid, totitemsaleprice, buckets, divnam, category, int_beauty) %>%
+  filter(grepl('BEAUTY|COSMETICS', divnam)) %>%
+  group_by(buckets, int_beauty) %>%
+  summarise(ncus = n_distinct(customerid),
+            tsp = sum(totitemsaleprice))
+
+beacos_dep_cus_table <- beacos_dep_cus %>%
+  select(buckets, int_beauty, ncus) %>%
+  group_by(int_beauty, buckets) %>% 
+  summarise(ntran = sum(ncus)) %>%
+  dcast(buckets ~ int_beauty)
+write.csv(beacos_dep_cus_table,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/beacos_dep_cus_table_gabe.csv") 
+
+
+# PET     
+pet_dep_cus <- dep_cus_bucket_ctg_V2 %>%
+  select(customerid, totitemsaleprice, buckets, divnam, category, dog_owner, cat_owner) %>%
+  replace(is.na(.), 0) %>%
+  mutate(pet_owner = rowSums(sapply(dep_cus_bucket_ctg_V2[, c(6,7)], as.numeric)))%>%
+  filter(grepl('PET', divnam)) %>%
+  group_by(buckets, pet_owner) %>%
+  summarise(ncus = n_distinct(customerid))
+
+pet_dep_cus_table <- pet_dep_cus %>%
+  select(buckets, pet_owner, ncus) %>%
+  group_by(pet_owner, buckets) %>% 
+  summarise(ntran = sum(ncus)) %>%
+  dcast(buckets ~ pet_owner)
+
+write.csv(pet_dep_cus_table,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/pet_dep_cus_table_gabe.csv") 
+
+# Exercise/Health
+ex_hea_dep_cus_v1 <- dep_cus_bucket_ctg_V2 %>%
+  select(customerid, totitemsaleprice, buckets, divnam, category, int_exercise_health, dptnam) %>%
+  filter(grepl('FOOTWEAR MENS|FOOTWEAR WOMENS', divnam)) %>%
+  filter(grepl('FW-ATHLETICS MENS|FW WOMENS ATHLETICS', dptnam)) %>%
+  group_by(buckets, int_exercise_health) %>%
+  summarise(ncus = n_distinct(customerid),
+            tsp = sum(totitemsaleprice))
+  
+ex_hea_dep_cus_v2 <- dep_cus_bucket_ctg_V2 %>%
+  select(customerid, totitemsaleprice, buckets, divnam, category, int_exercise_health) %>%
+  filter(grepl('LADIES ACTIVE|ACTIVE MENS', divnam)) %>%
+  group_by(buckets, int_exercise_health) %>%
+  summarise(ncus = n_distinct(customerid),
+            tsp = sum(totitemsaleprice))
+
+ex_hea_dep_cus_v1_table <- ex_hea_dep_cus_v1 %>%
+  select(buckets, int_exercise_health, ncus) %>%
+  group_by(int_exercise_health, buckets) %>% 
+  summarise(ntran = sum(ncus)) %>%
+  dcast(buckets ~ int_exercise_health)
+
+ex_hea_dep_cus_v2_table <- ex_hea_dep_cus_v2 %>%
+  select(buckets, int_exercise_health, ncus) %>%
+  group_by(int_exercise_health, buckets) %>% 
+  summarise(ntran = sum(ncus)) %>%
+  dcast(buckets ~ int_exercise_health)
+
+ex_hea_dep_cus_table <- cbind(ex_hea_dep_cus_v1_table, ex_hea_dep_cus_v2_table, by = "buckets")
+
+write.csv(ex_hea_dep_cus_table,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/ex_hea_dep_cus_table_gabe.csv") 
+
+```
+
+
+```{r seasonal shopping behavior analysis}
+bts_wk <- c(29, 30, 31, 32, 33, 34, 35, 36 ,37)
+w_holiday_wk <- c(45, 46, 47, 48, 49, 50, 51, 52)
+fathers_day <- c(24)
+mothers_day <- c(19)
+easter_day <- c(15)
+valentines_day <- c('2017-2-7', '2017-2-8', '2017-2-9', '2017-2-10', '2017-2-11', '2017-2-12','2017-2-13')
+v_days <- yday(valentines_day)
+
+# Back to school
+bts_wk <- total_tran_unit17 %>%
+  mutate(tran_week = week(trandate),
+         index_bts = ifelse(tran_week %in% bts_wk, 1, 0),
+         str_count = nchar(trimws(customerid))) %>%
+  filter(str_count >= 8) %>% 
+  inner_join(active_customers_f17[,c(1,11)], by = "customerid") %>%
+  group_by(buckets, index_bts) %>% 
+  summarise(ntran = n_distinct(customerid)) %>% 
+  dcast(buckets ~ index_bts)
+
+
+# Winter holidays
+w_holiday_wk <- total_tran_unit17 %>%
+  mutate(tran_week = week(trandate),
+         index_wh = ifelse(tran_week %in% w_holiday_wk, 1, 0),
+         str_count = nchar(trimws(customerid))) %>%
+  filter(str_count >= 8) %>% 
+  inner_join(active_customers_f17[,c(1,11)], by = "customerid") %>%
+  group_by(buckets, index_wh) %>% 
+  summarise(ntran = n_distinct(customerid)) %>% 
+  dcast(buckets ~ index_wh)
+
+
+# Father's Day 
+fd_wk <- total_tran_unit17 %>%
+  mutate(tran_week = week(trandate),
+         index_fd = ifelse(tran_week %in% fathers_day, 1, 0),
+         str_count = nchar(trimws(customerid))) %>%
+  filter(str_count >= 8) %>% 
+  inner_join(active_customers_f17[,c(1,11)], by = "customerid") %>%
+  group_by(buckets, index_fd) %>% 
+  summarise(ntran = n_distinct(customerid)) %>% 
+  dcast(buckets ~ index_fd)
+
+
+# Mother's Day 
+md_wk <- total_tran_unit17 %>%
+  mutate(tran_week = week(trandate),
+         index_md = ifelse(tran_week %in% mothers_day, 1, 0),
+         str_count = nchar(trimws(customerid))) %>%
+  filter(str_count >= 8) %>% 
+  inner_join(active_customers_f17[,c(1,11)], by = "customerid") %>%
+  group_by(buckets, index_md) %>% 
+  summarise(ntran = n_distinct(customerid)) %>% 
+  dcast(buckets ~ index_md)
+
+
+# Easter Day 
+ed_wk <- total_tran_unit17 %>%
+  mutate(tran_week = week(trandate),
+         index_ed = ifelse(tran_week %in% easter_day, 1, 0),
+         str_count = nchar(trimws(customerid))) %>%
+  filter(str_count >= 8) %>% 
+  inner_join(active_customers_f17[,c(1,11)], by = "customerid") %>%
+  group_by(buckets, index_ed) %>% 
+  summarise(ncus = n_distinct(customerid)) %>% 
+  dcast(buckets ~ index_ed)
+
+# Valentines Day 
+vd_wk <- total_tran_unit17 %>%
+  mutate(tran_day = yday(trandate),
+         index_vd = ifelse(tran_day %in% v_days, 1, 0),
+         str_count = nchar(trimws(customerid))) %>%
+  filter(str_count >= 8) %>% 
+  inner_join(active_customers_f17[,c(1,11)], by = "customerid") %>%
+  group_by(buckets, index_vd) %>% 
+  summarise(ntran = n_distinct(customerid)) %>% 
+  dcast(buckets ~ index_vd)
+
+total_seasonal <- do.call("cbind", list(vd_wk, ed_wk, md_wk, fd_wk, w_holiday_wk, bts_wk))
+write.csv(total_seasonal,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/Outputs- Gabe Stores/total_seasonal_gabe.csv") 
+
+# Fix the customerid string problem
+total_tran_unit17$customerid <- trimws(total_tran_unit17$customerid)
+
+hh_child_bts <- total_tran_unit17 %>%
+  select(tranid, trandate, customerid) %>% 
+  mutate(tran_week = week(trandate),
+         index_bts = ifelse(tran_week %in% bts_wk, 1, 0)) %>% 
+  group_by(customerid, index_bts) %>% 
+  summarise(ntran = n()) %>% 
+  inner_join(acxiom_filter_V2[,c(1,24,30)], by = c("customerid" = "accountid")) %>% 
+  mutate(index_hhchild = ifelse(hh_total_children == 0,0,1) ) %>% 
+  filter(index_hhchild %in% 1)
+
+child_bts <- hh_child_bts %>% 
+  select(customerid, index_bts, buckets)  %>% 
+  group_by(buckets, index_bts) %>% 
+  summarise(ncus = n()) %>% 
+  dcast(buckets ~ index_bts)
+write.csv(child_bts,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/Outputs- Gabe Stores/child_bts_gabe.csv")
+
+hh_child_axciom <- hh_child_axciom[,c(1,3,4,5,6)]
+
+colnames(hh_child_axciom) <- c("customerid","kids","buckets","bts","winter holiday")
+```
+
+
+```{r Internal meeting analysis request}
+active_customers_buc <- tranitemSummary %>%
+    select(tranid, 
+         gtin,
+         trandate, 
+         storeid, 
+         customerid, 
+         totdiscountamount, 
+         totitemsaleprice) %>% 
+    distinct() %>% 
+    mutate(str_count = nchar(trimws(customerid))) %>%
+    filter(trandate >= start.date,
+         trandate < end.date,
+         str_count >= 8,
+         customerid != "" ,
+         totitemsaleprice > 0,
+         storeid %in% gabe_list) %>% 
+    group_by(customerid) %>%
+    summarise(ntran = n_distinct(tranid), 
+              spend = sum(totitemsaleprice), 
+              sp_tran_avg = sum(totitemsaleprice)/ntran) %>% 
+    mutate(buckets = ifelse(ntran == 1, "one_and_done", 
+                            ifelse(ntran > 1 & ntran < 4 & sp_tran_avg < 44, "repeat_customers", 
+                                   ifelse(ntran > 1 & ntran < 4 & sp_tran_avg > 44, "repeat_highvalue_customers",
+                                          ifelse(ntran >= 4 & sp_tran_avg < 44, "loyal_customers", "loyal_highvalue_customers"))))) %>% 
+    ungroup() %>% 
+    collect()
+
+product_mix <- tranitemSummary  %>%
+  select(tranid, 
+         gtin,
+         trandate, 
+         storeid, 
+         customerid, 
+         totdiscountamount, 
+         totitemsaleprice) %>% 
+  filter(trandate >= start.date,
+         trandate < end.date,
+         customerid != "" ,
+         totitemsaleprice > 0,
+         storeid %in% gabe_list) %>% 
+  inner_join(itemsMaster, by = c("gtin" = "ugtin")) %>% 
+  inner_join(merchHierarchy, by = c("icls" = "ccls")) %>%
+  group_by(customerid, divnam, dptnam) %>% 
+  summarise(ntran = n_distinct(tranid),
+            spend = sum(totitemsaleprice),
+            nunit = n(),
+            discount = sum(totdiscountamount)) %>%
+  ungroup() %>% 
+  collect()
+
+product_mix_buc_sp <- product_mix %>% 
+  inner_join(active_customers_buc[,c(1,5)]) %>% 
+  group_by(divnam, dptnam, buckets) %>% 
+  summarise(spend = sum(spend)) %>% 
+  dcast(divnam + dptnam ~ buckets)
+
+product_mix_buc_unit <- product_mix %>% 
+  inner_join(active_customers_buc[,c(1,5)]) %>% 
+  group_by(divnam, dptnam, buckets) %>% 
+  summarise(spend = sum(nunit)) %>% 
+  dcast(divnam + dptnam ~ buckets)
+
+write.csv(product_mix_buc_sp,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/product_mix_buc_sp_gabe.csv")
+write.csv(product_mix_buc_unit,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/product_mix_buc_unit_gabe.csv")
+```
+
+```{r Market Basket Analysis - Association Rules}
+start.date <- '2017-01-01'
+end.date   <- '2017-01-31'
+
+tran_item_list <- tranitemSummary %>% 
+  mutate(str_count = nchar(trimws(tranitemSummary$customerid))) %>%
+  filter(trandate >= start.date,
+         trandate < end.date,
+         str_count >= 8,
+         customerid != "" ,
+         totitemsaleprice > 0,
+         storeid %in% open_store_num) %>% 
+  left_join(itemsMaster, by = c("gtin" = "ugtin")) %>% 
+  select(trandate, tranno, ides) %>% 
+  collect()
+
+if(sessionInfo()['basePkgs']=="dplyr" | sessionInfo()['otherPkgs']=="dplyr"){
+  detach(package:dplyr, unload=TRUE)
+}
+
+library(plyr)
+
+tran <- ddply(tran_item_list, c("trandate", "tranno"),
+function(df1)paste(df1$ides,
+                   collapse = ","))
+
+max.cart.size <- max(sapply((str_extract_all(tran$V1, pattern = ",")), length))
+
+all.tran <- nrow(tran) ## 2157
+
+basket <- tran[,]
+
+basket$trandate <- NULL
+basket$tranno   <- NULL
+
+colnames(basket) <- c("itemList")
+
+#write to csv format
+write.csv(basket,"itemList.csv", quote = FALSE, row.names = TRUE)
+
+
+#load package required
+library(arules)
+
+#convert csv file to basket format
+txn = read.transactions(file = "itemList.csv", rm.duplicates= FALSE, format = "basket",sep = ",", cols = 1);
+
+#remove quotes from transactions
+txn@itemInfo$labels <- gsub("\"","",txn@itemInfo$labels)
+
+
+#run apriori algorithm
+basket_rules <- apriori(txn,parameter = list(minlen = 2, sup = 0.001, conf = 0.01, target = "rules"))
+#basket_rules <- apriori(txn,parameter = list(minlen=2,sup = 0.00001, conf = 0.01, target="rules"),appearance = list(lhs = "CLEMENTINES")))
+
+#check if tm is attched; if yes then detach
+if(sessionInfo()['basePkgs'] =="tm" | sessionInfo()['otherPkgs']=="tm"){
+  detach(package:sentiment, unload=TRUE)
+  detach(package:tm, unload=TRUE)
+}
+
+set.seed(123)
+index <- sample(1:nrow(iris), 5)
+#view rules
+# inspect(basket_rules)
+
+#convert to datframe and view; optional
+df_basket <- as(basket_rules,"data.frame")
+df_basket$confidence <- df_basket$confidence * 100
+
+library(sparklyr)
+library(dplyr)
+sc <- spark_connect(master = "local")
+
+```
+
+```{r department analysis}
+dep_cus_bucket_ctg$customerid <- trimws(dep_cus_bucket_ctg$customerid)
+dep_age_buc <- dep_cus_bucket_ctg %>% 
+  select(tranid, gtin, customerid, dptnam, buckets) %>% 
+  inner_join(acxiom_filter_V3[,c(1,31)], by = c("customerid" = "accountid")) %>% 
+  group_by(buckets, dptnam, age_grp) %>% 
+  summarise(nitem = n()) %>% 
+  dcast(buckets + dptnam ~ age_grp)
+  
+dep_gender_buc <- dep_cus_bucket_ctg %>% 
+  select(tranid, gtin, customerid, dptnam, buckets) %>% 
+  inner_join(acxiom_filter_V2[,c(1,21)], by = c("customerid" = "accountid")) %>% 
+  group_by(buckets, dptnam, gender_email) %>% 
+  summarise(nitem = n()) %>% 
+  dcast(buckets + dptnam ~ gender_email)
+write.csv(dep_gender_buc,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/dep_gender_buc.csv")
+write.csv(dep_age_buc,"~/R/Projects/R-DCM/Personal/Lisa/Gabe's/dep_age_buc.csv")
+```
+
+
